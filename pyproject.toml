@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alexa-pay-mcp"
+version = "0.1.0"
+description = "MCP server giving Alexa+ agents a wallet: pay for 402-gated resources over the AwLPay x402 rail"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = ["mcp[cli]>=1.0.0,<2", "httpx>=0.27.0", "eth-account>=0.11.0"]
+
+[project.scripts]
+alexa-pay-mcp = "alexa_pay_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
