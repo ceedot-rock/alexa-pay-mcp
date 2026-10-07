@@ -1,5 +1,7 @@
 # alexa-pay-mcp
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 **Give an Alexa+ agent a wallet.** A self-hosted MCP server (spec 2025-11-25,
 Streamable HTTP) that lets an AI agent pay for 402-gated resources — powered
 by the [AwLPay](https://github.com/ceedot-rock/awlpay) x402 rail.
