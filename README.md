@@ -81,11 +81,16 @@ Wallet: `AWL_WALLET_PASSWORD`, `AWL_WALLET_DIR`; mainnet additionally needs
 
 ## Product feedback (for Amazon)
 
-*Stub — fill during the hackathon window:*
-
-- What worked:
-- What didn't:
-- What we'd change about the Alexa+ MCP surface:
+- What worked: FastMCP made the Streamable HTTP server straightforward; the
+  MCP 2025-11-25 tool surface mapped cleanly onto a pay/quote/verify flow;
+  EIP-712 typed-data signing keeps the auth gasless and resource-bound.
+- What didn't: end-to-end testing against a real Alexa+ client requires
+  Amazon-side access we don't have — all client interop was validated
+  against the MCP inspector and stdio/HTTP transports locally.
+- What we'd change about the Alexa+ MCP surface: a standard way for a
+  server to advertise payment capability (402 handling, accepted rails) in
+  its capability handshake, so agents discover "I can pay" the same way
+  they discover tools.
 
 ## License
 
