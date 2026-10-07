@@ -1,0 +1,46 @@
+# Audited checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: Test suite (29 tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --no-cache-dir -r requirements.txt
+      - name: Run the test suite
+        run: PYTHONPATH=src .venv/bin/python -m pytest -q
+
+  http:
+    name: HTTP smoke test (Streamable HTTP + /about)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --no-cache-dir -r requirements.txt
+      - name: Boot and probe
+        run: |
+          MCP_TRANSPORT=streamable-http PORT=8080 PYTHONPATH=src \
+            .venv/bin/python -m alexa_pay_mcp.server &
+          for i in $(seq 1 20); do curl -sf localhost:8080/about && break; sleep 1; done
+          curl -sf localhost:8080/about | grep -q '"service":"alexa-pay-mcp"'
+          curl -sf localhost:8080/about | grep -q '"ok":true'
