@@ -17,14 +17,16 @@ import os
 import sys
 
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
-from . import facilitator
+from . import __version__, facilitator
 from .amounts import parse_amount, format_amount, to_micro_usd
 from .rails import list_rails as _list_rails, get_rail
 from .wallet import AgentWallet, WalletError
 from .x402 import pay_resource, verify_receipt as _verify_receipt
 
-mcp = FastMCP("alexa-pay")
+mcp = FastMCP("alexa-pay", port=int(os.environ.get("PORT", "8000")))
 
 MOCK_RAILS = ["base-usdc", "solana-usdc"]
 
@@ -144,6 +146,24 @@ def wallet_balance(wallet_password: str | None = None) -> dict:
         }
     except WalletError as e:
         return {"ok": False, "error": str(e)}
+
+
+@mcp.custom_route("/about", methods=["GET"])
+async def about(_request: Request) -> JSONResponse:
+    """Service/about JSON for Streamable HTTP deployments.
+
+    A health endpoint that proves the server is up without invoking a tool.
+    """
+    return JSONResponse({
+        "ok": True,
+        "service": "alexa-pay-mcp",
+        "version": __version__,
+        "mcp_spec": "2025-11-25",
+        "mode": facilitator.mode(),
+        "tools": ["pay", "quote", "verify_receipt", "list_rails",
+                  "wallet_balance"],
+        "rails": [r["rail"] for r in _list_rails()],
+    })
 
 
 def main() -> None:
