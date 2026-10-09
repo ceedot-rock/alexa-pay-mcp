@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
+import socket
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -23,6 +26,39 @@ from .rails import get_rail, EVM_RAILS
 from .wallet import AgentWallet, SpendCapExceeded
 
 X402_VERSION = 2  # multi-rail accepts[] shape
+
+
+def validate_resource_url(url: str) -> None:
+    """Fail closed on SSRF (2026-10-08 disclosure): only http/https, and the
+    target must not resolve to a private, loopback, link-local, reserved,
+    multicast, or unspecified address.
+
+    Call on live-mode URLs only — the mock seller deliberately binds
+    loopback, so mock/demo flows must NOT pass through this.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"refusing resource URL with scheme {parsed.scheme!r}: http/https only"
+        )
+    host = parsed.hostname
+    if not host:
+        raise ValueError("refusing resource URL with no host")
+    try:
+        addrinfo = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise ValueError(f"resource host {host!r} does not resolve: {e}")
+    for info in addrinfo:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise ValueError(f"refusing resource at internal address {ip}")
 
 
 def _http_get(url: str, headers: dict | None = None, timeout: int = 15) -> tuple[int, dict | str]:

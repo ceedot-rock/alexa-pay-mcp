@@ -78,8 +78,18 @@ PYTHONPATH=src .venv/bin/python -m pytest tests/ -q   # 29 passed
 ```
 
 Live mode: `AWL_MODE=live` (default `AWLPAY_BASE_URL=https://awlpay.fly.dev`).
-Wallet: `AWL_WALLET_PASSWORD`, `AWL_WALLET_DIR`; mainnet additionally needs
-`AWL_NETWORK=mainnet` + `AWL_MAINNET_CONFIRM="I UNDERSTAND"`.
+Wallet: `AWL_WALLET_PASSWORD` (required — no default), `AWL_WALLET_DIR`;
+mainnet additionally needs `AWL_NETWORK=mainnet` +
+`AWL_MAINNET_CONFIRM="I UNDERSTAND"`.
+
+Security (fail closed since the 2026-10-08 disclosure):
+
+- The Streamable-HTTP transport (`MCP_TRANSPORT=streamable-http`) refuses to
+  start without `MCP_BEARER_TOKEN`; every request needs the matching
+  `Authorization: Bearer` header. It binds `127.0.0.1` by default
+  (override with `MCP_HTTP_HOST`, `MCP_HTTP_PORT`).
+- Live-mode `resource_url`s are scheme-checked (http/https only) and refused
+  when they resolve to internal addresses.
 
 ## Product feedback (for Amazon)
 

@@ -24,7 +24,7 @@ from . import __version__, facilitator
 from .amounts import parse_amount, format_amount, to_micro_usd
 from .rails import list_rails as _list_rails, get_rail
 from .wallet import AgentWallet, WalletError
-from .x402 import pay_resource, verify_receipt as _verify_receipt
+from .x402 import pay_resource, verify_receipt as _verify_receipt, validate_resource_url
 
 mcp = FastMCP("alexa-pay", port=int(os.environ.get("PORT", "8000")))
 
@@ -32,7 +32,14 @@ MOCK_RAILS = ["base-usdc", "solana-usdc"]
 
 
 def _wallet(password: str | None = None) -> AgentWallet:
-    pw = password or os.getenv("AWL_WALLET_PASSWORD", "alexa-pay-demo")
+    # Fail closed (2026-10-08 coordinated disclosure, CWE-798): the hard-coded
+    # demo-password fallback is gone. No password configured, no wallet.
+    pw = password or os.getenv("AWL_WALLET_PASSWORD")
+    if not pw:
+        raise WalletError(
+            "wallet password is not configured: pass wallet_password to the tool "
+            "or set the AWL_WALLET_PASSWORD environment variable"
+        )
     network = os.getenv("AWL_NETWORK", "testnet")
     confirm = os.getenv("AWL_MAINNET_CONFIRM")
     return AgentWallet(password=pw, network=network, confirm_mainnet=confirm)
@@ -57,7 +64,10 @@ def pay(
         amount_units = parse_amount(amount, rail_info["decimals"])  # validates
         wallet = _wallet(wallet_password)
         if facilitator.mode() == "live":
-            # Live: real seller URL, real AwLPay rails.
+            # Live: real seller URL, real AwLPay rails. SSRF guard first: the
+            # URL comes from the caller, and _http_get must never touch
+            # internal addresses (2026-10-08 disclosure, CWE-918).
+            validate_resource_url(resource_url)
             result = pay_resource(
                 wallet=wallet, resource_url=resource_url,
                 amount_str=amount, payer_rails=[rail],
@@ -170,7 +180,41 @@ def main() -> None:
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     # stdio for local dev (Claude Desktop / inspector); streamable-http for
     # self-hosted Alexa+ track deployments (MCP spec 2025-11-25).
-    mcp.run(transport=transport)
+    if transport == "streamable-http":
+        _run_streamable_http()
+    else:
+        mcp.run(transport=transport)
+
+
+def _run_streamable_http() -> None:
+    """Streamable-HTTP behind mandatory bearer auth, loopback-bound by default.
+
+    Fail closed (2026-10-08 coordinated disclosure, CWE-306): the HTTP
+    transport refuses to start without an explicit MCP_BEARER_TOKEN, and
+    binds 127.0.0.1 unless MCP_HTTP_HOST overrides it.
+    """
+    import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    token = os.getenv("MCP_BEARER_TOKEN")
+    if not token:
+        sys.exit(
+            "refusing to start the streamable-http transport without "
+            "MCP_BEARER_TOKEN set (unauthenticated payment surface)"
+        )
+
+    class _BearerAuth(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):  # type: ignore[no-untyped-def]
+            if request.headers.get("authorization", "") != f"Bearer {token}":
+                return JSONResponse(
+                    {"error": "unauthorized: valid Bearer token required"}, 401
+                )
+            return await call_next(request)
+
+    host = os.getenv("MCP_HTTP_HOST", "127.0.0.1")
+    port = int(os.getenv("MCP_HTTP_PORT", "8000"))
+    uvicorn.run(_BearerAuth(mcp.streamable_http_app()), host=host, port=port)
 
 
 if __name__ == "__main__":
