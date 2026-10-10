@@ -1,3 +1,7 @@
+> **This repo has moved into the verse.** Development continues at
+> [ceedot-rock/WalletVerse](https://github.com/ceedot-rock/WalletVerse), in folder alexa-pay-mcp/.
+> This copy is archived and read-only - history preserved, nothing lost.
+
 # alexa-pay-mcp
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
