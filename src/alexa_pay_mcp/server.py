@@ -13,6 +13,7 @@ Tools:
 """
 from __future__ import annotations
 
+import hmac
 import os
 import sys
 
@@ -31,14 +32,17 @@ mcp = FastMCP("alexa-pay", port=int(os.environ.get("PORT", "8000")))
 MOCK_RAILS = ["base-usdc", "solana-usdc"]
 
 
-def _wallet(password: str | None = None) -> AgentWallet:
+def _wallet() -> AgentWallet:
     # Fail closed (2026-10-08 coordinated disclosure, CWE-798): the hard-coded
     # demo-password fallback is gone. No password configured, no wallet.
-    pw = password or os.getenv("AWL_WALLET_PASSWORD")
+    # The password comes from server-side env ONLY — never from a tool
+    # parameter, where it would transit the MCP tool-call surface (client,
+    # logs, transcripts) (MEDIUM-04).
+    pw = os.getenv("AWL_WALLET_PASSWORD")
     if not pw:
         raise WalletError(
-            "wallet password is not configured: pass wallet_password to the tool "
-            "or set the AWL_WALLET_PASSWORD environment variable"
+            "wallet password is not configured: set the "
+            "AWL_WALLET_PASSWORD environment variable"
         )
     network = os.getenv("AWL_NETWORK", "testnet")
     confirm = os.getenv("AWL_MAINNET_CONFIRM")
@@ -50,7 +54,6 @@ def pay(
     resource_url: str,
     amount: str,
     rail: str = "base-usdc",
-    wallet_password: str | None = None,
 ) -> dict:
     """Pay for a 402-gated resource.
 
@@ -62,7 +65,7 @@ def pay(
     try:
         rail_info = get_rail(rail)
         amount_units = parse_amount(amount, rail_info["decimals"])  # validates
-        wallet = _wallet(wallet_password)
+        wallet = _wallet()
         if facilitator.mode() == "live":
             # Live: real seller URL, real AwLPay rails. SSRF guard first: the
             # URL comes from the caller, and _http_get must never touch
@@ -138,14 +141,14 @@ def list_rails() -> dict:
 
 
 @mcp.tool()
-def wallet_balance(wallet_password: str | None = None) -> dict:
+def wallet_balance() -> dict:
     """Local wallet address, network, caps, and lifetime spend ledger.
 
     Mock mode reports the ledger only (no chain scan). Live mode would add
     per-rail on-chain balances.
     """
     try:
-        wallet = _wallet(wallet_password)
+        wallet = _wallet()
         return {
             "address": wallet.address,
             "network": wallet.network,
@@ -174,6 +177,14 @@ async def about(_request: Request) -> JSONResponse:
                   "wallet_balance"],
         "rails": [r["rail"] for r in _list_rails()],
     })
+
+
+def _bearer_authorized(header_value: str, token: str) -> bool:
+    """Constant-time bearer-token check (LOW-01): hmac.compare_digest
+    instead of a plain !=, so the comparison leaks no prefix timing."""
+    return hmac.compare_digest(
+        header_value.encode("utf-8"), f"Bearer {token}".encode("utf-8")
+    )
 
 
 def main() -> None:
@@ -206,7 +217,7 @@ def _run_streamable_http() -> None:
 
     class _BearerAuth(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):  # type: ignore[no-untyped-def]
-            if request.headers.get("authorization", "") != f"Bearer {token}":
+            if not _bearer_authorized(request.headers.get("authorization", ""), token):
                 return JSONResponse(
                     {"error": "unauthorized: valid Bearer token required"}, 401
                 )

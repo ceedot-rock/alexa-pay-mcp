@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alexa-pay-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server giving Alexa+ agents a wallet: pay for 402-gated resources over the AwLPay x402 rail"
 readme = "README.md"
 license = { text = "Apache-2.0" }

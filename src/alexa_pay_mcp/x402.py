@@ -12,7 +12,7 @@ gets a 409, never a double-settle.
 from __future__ import annotations
 
 import base64
-import hashlib
+import http.client
 import ipaddress
 import json
 import socket
@@ -21,17 +21,32 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
-from .amounts import parse_amount, to_micro_usd
+from .amounts import parse_amount, rail_amount_to_micro_usd
 from .rails import get_rail, EVM_RAILS
 from .wallet import AgentWallet, SpendCapExceeded
 
 X402_VERSION = 2  # multi-rail accepts[] shape
 
 
+# IPs the SSRF guard has validated, keyed by hostname. The fetch layer
+# dials the pinned IP instead of resolving the name again, so the address
+# that was checked is the address that gets connected to — a DNS answer
+# that flips between validation and connect (rebinding) lands nowhere
+# (MEDIUM-03).
+_PINNED_IPS: dict[str, str] = {}
+
+
+def _pinned_ip_for(host: str) -> str | None:
+    return _PINNED_IPS.get(host.lower())
+
+
 def validate_resource_url(url: str) -> None:
     """Fail closed on SSRF (2026-10-08 disclosure): only http/https, and the
     target must not resolve to a private, loopback, link-local, reserved,
     multicast, or unspecified address.
+
+    On success the first validated IP is pinned for the host (see
+    _PINNED_IPS): the fetch layer connects to exactly that IP.
 
     Call on live-mode URLs only — the mock seller deliberately binds
     loopback, so mock/demo flows must NOT pass through this.
@@ -48,6 +63,7 @@ def validate_resource_url(url: str) -> None:
         addrinfo = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
         raise ValueError(f"resource host {host!r} does not resolve: {e}")
+    ips: list[str] = []
     for info in addrinfo:
         ip = ipaddress.ip_address(info[4][0])
         if (
@@ -59,12 +75,84 @@ def validate_resource_url(url: str) -> None:
             or ip.is_unspecified
         ):
             raise ValueError(f"refusing resource at internal address {ip}")
+        ips.append(str(ip))
+    if ips:
+        _PINNED_IPS[host.lower()] = ips[0]
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Dial the guard-pinned IP for the host when one exists, so the
+    address the SSRF guard validated is the address connected to. The
+    Host header was already emitted from the real hostname before
+    connect() runs, so it is unaffected by the swapped dial target."""
+
+    def connect(self):  # mirrors stdlib, with a pinned dial target
+        ip = _pinned_ip_for(self.host)
+        if ip is None:
+            return super().connect()
+        real_host, self.host = self.host, ip
+        try:
+            return super().connect()
+        finally:
+            self.host = real_host
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS variant: TCP dials the pinned IP; TLS SNI and certificate
+    verification still use the real hostname."""
+
+    def connect(self):  # mirrors stdlib HTTPS connect, with a pinned dial
+        ip = _pinned_ip_for(self.host)
+        if ip is None:
+            return super().connect()
+        real_host, self.host = self.host, ip
+        try:
+            http.client.HTTPConnection.connect(self)
+        finally:
+            self.host = real_host
+        server_hostname = self._tunnel_host or real_host
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=server_hostname
+        )
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):  # noqa: D102 - stdlib handler shape
+        return self.do_open(_PinnedHTTPConnection, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):  # noqa: D102 - stdlib handler shape
+        return self.do_open(
+            _PinnedHTTPSConnection, req,
+            context=self._context, check_hostname=self._check_hostname,
+        )
+
+
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect hop against the SSRF guard (HIGH-01).
+
+    The initial URL is the caller's choice — live mode validates it in
+    server.pay; mock mode deliberately uses a loopback seller. A redirect
+    target is the COUNTERPARTY's choice and is never trusted: each hop
+    must pass the same validate_resource_url policy before it is fetched
+    (which also pins the hop's IP, closing the rebinding window per hop).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_resource_url(urllib.parse.urljoin(req.full_url, newurl))
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(
+    _PinnedHTTPHandler(), _PinnedHTTPSHandler(), _GuardedRedirectHandler(),
+)
 
 
 def _http_get(url: str, headers: dict | None = None, timeout: int = 15) -> tuple[int, dict | str]:
     req = urllib.request.Request(url, headers=headers or {})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             body = resp.read().decode()
     except urllib.error.HTTPError as e:
         body = e.read().decode()
@@ -163,10 +251,13 @@ def build_payment_proof(
         raise ValueError(
             f"amount {amount_units} below seller requirement {required_units}"
         )
-    # Caps enforced in micro-USD before any signature exists.
-    wallet.check_spend(to_micro_usd(amount_units, rail_info["decimals"]))
+    # Caps enforced in micro-USD before any signature exists. The
+    # conversion is priced per the rail's token and fails closed when no
+    # price is configured — never a silent $1.00 for a non-stablecoin
+    # (LOW-03).
+    wallet.check_spend(rail_amount_to_micro_usd(amount_units, rail_info))
 
-    nonce = hashlib.sha256(f"{wallet.address}{resource_url}{time.time_ns()}".encode()).hexdigest()
+    nonce = wallet.payment_nonce(resource_url)
     typed = payment_typed_data(
         payer=wallet.address,
         pay_to=entry.get("payTo", ""),
@@ -193,7 +284,7 @@ def build_payment_proof(
         "x_payment": base64.urlsafe_b64encode(proof_json).decode(),
         "proof": proof,
         "amount_units": amount_units,
-        "amount_micro_usd": to_micro_usd(amount_units, rail_info["decimals"]),
+        "amount_micro_usd": rail_amount_to_micro_usd(amount_units, rail_info),
     }
 
 
@@ -250,22 +341,43 @@ def pay_resource(
     amount_str: str,
     payer_rails: list[str],
 ) -> dict:
-    """Full flow: 402 -> select rail -> sign -> settle -> record -> receipt."""
+    """Full flow: 402 -> select rail -> sign -> settle -> record -> receipt.
+
+    The sign -> settle -> record span runs under the wallet's spend lock
+    (HIGH-02): a concurrent payment cannot check the lifetime cap against
+    state from before this payment recorded. A receipt that fails
+    verification fails the payment (MEDIUM-02): the settled spend is
+    recorded flagged UNVERIFIED — it still counts against the lifetime
+    cap, because the money moved — and the call raises instead of
+    returning a clean payment.
+    """
     requirements = fetch_payment_requirements(resource_url)
     selection = select_rail(requirements, payer_rails)
     rail, entry = selection["rail"], selection["entry"]
-    built = build_payment_proof(
-        wallet=wallet, rail=rail, entry=entry,
-        resource_url=resource_url, amount_str=amount_str,
-    )
-    receipt = settle(resource_url, built["x_payment"])
-    rail_info = get_rail(rail)
-    verification = verify_receipt(receipt, {
-        "amount_units": built["amount_units"],
-        "rail": rail,
-        "pay_to": entry.get("payTo"),
-    })
-    wallet.record_spend(built["amount_micro_usd"], receipt)
+    with wallet.spend_lock():
+        built = build_payment_proof(
+            wallet=wallet, rail=rail, entry=entry,
+            resource_url=resource_url, amount_str=amount_str,
+        )
+        receipt = settle(resource_url, built["x_payment"])
+        rail_info = get_rail(rail)
+        verification = verify_receipt(receipt, {
+            "amount_units": built["amount_units"],
+            "rail": rail,
+            "pay_to": entry.get("payTo"),
+        })
+        wallet.record_spend(
+            built["amount_micro_usd"], receipt, verification=verification
+        )
+        if not verification["ok"]:
+            failed = [
+                c["check"] for c in verification["checks"] if not c["pass"]
+            ]
+            raise ValueError(
+                "settlement receipt failed verification "
+                f"({', '.join(failed)}); the settled spend is recorded "
+                "in the ledger flagged UNVERIFIED"
+            )
     return {
         "receipt": receipt,
         "verification": verification,

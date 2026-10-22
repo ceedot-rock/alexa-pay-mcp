@@ -10,10 +10,19 @@
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import hmac
 import json
 import os
+import threading
 import time
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX: in-process lock only (see spend_lock)
+    fcntl = None  # type: ignore[assignment]
 
 from eth_account import Account
 
@@ -88,11 +97,24 @@ class AgentWallet:
             except OSError:
                 pass
         self.address = Account.from_key(self._private_key).address
+        # Spend-lock state (HIGH-02): an RLock serializes threads sharing
+        # this instance; an OS file lock on <ledger>.lock serializes across
+        # instances/processes (the server builds a fresh wallet per call).
+        self._spend_rlock = threading.RLock()
+        self._lock_depth = 0
+        self._lock_fd: int | None = None
         self._ledger = self._load_ledger()
 
     # -- ledger -----------------------------------------------------------
     def _load_ledger(self) -> dict:
         if self.ledger_path.exists():
+            # The ledger is the full payment history: tighten a looser
+            # pre-existing file to owner-only on open (MEDIUM-01).
+            try:
+                if os.stat(self.ledger_path).st_mode & 0o077:
+                    self.ledger_path.chmod(0o600)
+            except OSError:
+                pass
             try:
                 return json.loads(self.ledger_path.read_text())
             except (json.JSONDecodeError, OSError):
@@ -100,7 +122,54 @@ class AgentWallet:
         return {"lifetime_spent_micro_usd": 0, "payments": []}
 
     def _save_ledger(self) -> None:
-        self.ledger_path.write_text(json.dumps(self._ledger, indent=2))
+        # Born 0600 like the keystore (os.open mode), and chmod after the
+        # write also tightens a file that already existed looser.
+        data = json.dumps(self._ledger, indent=2)
+        fd = os.open(self.ledger_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        try:
+            self.ledger_path.chmod(0o600)
+        except OSError:
+            pass
+
+    # -- spend lock ---------------------------------------------------------
+    @contextlib.contextmanager
+    def spend_lock(self):
+        """Hold the check -> settle -> record window for this ledger.
+
+        The lifetime cap is only sound if no second payment can check
+        against state from before the first payment recorded (HIGH-02
+        TOCTOU). Entering the lock reloads the ledger from disk, so a
+        fresh per-call wallet instance always checks current state.
+        Re-entrant for the owning thread/instance.
+        """
+        with self._spend_rlock:
+            if self._lock_depth > 0:
+                self._lock_depth += 1
+                try:
+                    yield
+                finally:
+                    self._lock_depth -= 1
+                return
+            lock_path = self.ledger_path.with_name(self.ledger_path.name + ".lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                self._ledger = self._load_ledger()
+                self._lock_fd = fd
+                self._lock_depth = 1
+                try:
+                    yield
+                finally:
+                    self._lock_depth = 0
+                    self._lock_fd = None
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
     @property
     def lifetime_spent_micro_usd(self) -> int:
@@ -124,18 +193,55 @@ class AgentWallet:
                 f"(spent {self.lifetime_spent_micro_usd}, adding {amount_micro_usd})"
             )
 
-    def record_spend(self, amount_micro_usd: int, receipt: dict) -> None:
-        self._ledger["lifetime_spent_micro_usd"] = (
-            self.lifetime_spent_micro_usd + amount_micro_usd
-        )
-        self._ledger["payments"].append(
-            {
+    def record_spend(
+        self,
+        amount_micro_usd: int,
+        receipt: dict,
+        verification: dict | None = None,
+    ) -> None:
+        """Append a settled spend to the ledger, under the spend lock.
+
+        With `verification` given, the entry carries its verdict: a
+        receipt that failed verification is stored flagged
+        (verified=False + the failed check names), never as a clean
+        payment (MEDIUM-02). The amount counts against the lifetime cap
+        either way — the money moved; the cap is an accounting control,
+        not a trophy shelf.
+        """
+        with self.spend_lock():
+            entry: dict = {
                 "amount_micro_usd": amount_micro_usd,
                 "receipt": receipt,
                 "at": int(time.time()),
             }
-        )
-        self._save_ledger()
+            if verification is not None:
+                entry["verified"] = bool(verification.get("ok"))
+                if not verification.get("ok"):
+                    entry["verification_failed_checks"] = [
+                        c["check"]
+                        for c in verification.get("checks", [])
+                        if not c.get("pass")
+                    ]
+            self._ledger["lifetime_spent_micro_usd"] = (
+                self.lifetime_spent_micro_usd + amount_micro_usd
+            )
+            self._ledger["payments"].append(entry)
+            self._save_ledger()
+
+    def payment_nonce(self, resource_url: str) -> str:
+        """Unguessable per-payment nonce (the proofId / EIP-712 nonce).
+
+        HMAC-SHA256 keyed by the wallet's private key over the resource
+        URL and a nanosecond timestamp: unique per payment, and NOT
+        recomputable from public inputs — address + URL + observed time
+        sufficed against the previous plain-sha256 construction (LOW-02).
+        The private key never leaves this object; callers get the digest.
+        """
+        key_hex = self._private_key
+        if key_hex.startswith("0x"):
+            key_hex = key_hex[2:]
+        msg = f"{self.address}{resource_url}{time.time_ns()}".encode()
+        return hmac.new(bytes.fromhex(key_hex), msg, hashlib.sha256).hexdigest()
 
     # -- signing ----------------------------------------------------------
     def sign_typed_data(self, typed_data: dict) -> bytes:

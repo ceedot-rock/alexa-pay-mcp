@@ -6,6 +6,8 @@ Floats are refused at the door: float("1.10") is already a lie in binary.
 """
 from __future__ import annotations
 
+import os
+
 
 class AmountError(ValueError):
     """Raised when an amount cannot be represented exactly."""
@@ -57,6 +59,44 @@ def to_micro_usd(units: int, rail_decimals: int, usd_per_token: str = "1.00") ->
 
     usd_per_token is a decimal string (default 1.00 for stablecoins).
     Pure integer math: units * price // scale.
+
+    Low-level converter: the payment path must NOT call this with the
+    default price for a non-stablecoin — use rail_amount_to_micro_usd,
+    which resolves the price per token and fails closed (LOW-03).
     """
     price_micro = parse_amount(usd_per_token, MICRO_USD_DECIMALS)
     return units * price_micro // (10 ** rail_decimals)
+
+
+# Tokens with a configured USD price for spend-cap accounting. Only the
+# $1-pegged stablecoins carry a built-in price. Any other token must be
+# priced explicitly by the operator (env AWL_USD_PRICE_<TOKEN>) or the
+# conversion refuses: valuing 1 BTC as $1.00 would under-count real spend
+# against the caps by orders of magnitude (LOW-03).
+TOKEN_USD_PRICES: dict[str, str] = {"USDC": "1.00", "USDT": "1.00"}
+
+
+def token_usd_price(token: str) -> str:
+    """Configured USD price (decimal string) for a token, or fail closed."""
+    env_price = os.getenv(f"AWL_USD_PRICE_{token.upper()}")
+    if env_price:
+        parse_amount(env_price, MICRO_USD_DECIMALS)  # validate the format
+        return env_price
+    try:
+        return TOKEN_USD_PRICES[token.upper()]
+    except KeyError:
+        raise AmountError(
+            f"no USD price configured for token {token!r}: refusing to "
+            "value it at $1.00 for spend-cap accounting. Set "
+            f"AWL_USD_PRICE_{token.upper()} to enable payments on this rail."
+        ) from None
+
+
+def rail_amount_to_micro_usd(units: int, rail_info: dict) -> int:
+    """Convert a rail-native amount to micro-USD for spend-cap accounting,
+    priced per the rail's token (see token_usd_price)."""
+    return to_micro_usd(
+        units,
+        int(rail_info["decimals"]),
+        token_usd_price(str(rail_info["token"])),
+    )
